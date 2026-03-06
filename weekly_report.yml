@@ -1,0 +1,63 @@
+# .github/workflows/weekly_report.yml
+#
+# Runs every Monday at 7:00 AM UTC.
+# You can also trigger it manually from the Actions tab (workflow_dispatch).
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   SMTP_HOST   — e.g. smtp.gmail.com
+#   SMTP_PORT   — e.g. 587
+#   SMTP_USER   — your Gmail address
+#   SMTP_PASS   — Gmail App Password (16-char, NOT your login password)
+#   EMAIL_TO    — recipient address
+
+name: Weekly Dividend Kings Report
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"   # Every Monday at 07:00 UTC
+  workflow_dispatch:        # Allow manual trigger from the Actions tab
+
+jobs:
+  send_report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # 1. Check out the repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Fetch live data and generate the HTML report
+      - name: Generate report
+        run: python generate_report.py
+
+      # 5. Send the email
+      - name: Send email
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO:  ${{ secrets.EMAIL_TO }}
+        run: python send_email.py
+
+      # 6. Upload the generated HTML as a workflow artifact (optional, 7-day retention)
+      #    Lets you download any report directly from the Actions run page.
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dividend-kings-report-${{ github.run_id }}
+          path: dividend_kings_email_live.html
+          retention-days: 7
