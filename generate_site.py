@@ -1,0 +1,815 @@
+"""
+generate_site.py
+================
+Generates docs/index.html — the full interactive Dividend Kings site
+published to GitHub Pages. Uses the same live data fetched by generate_report.py.
+
+Run after generate_report.py, or standalone:
+    python generate_site.py
+"""
+
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Re-use all fetch/score logic from generate_report
+from generate_report import (
+    KINGS_META, TICKERS,
+    fetch_stock, compute_best_value, sma_label
+)
+
+
+def build_site(scored_stocks, run_date, run_ts):
+    """Inject live data into the full interactive report template."""
+
+    # Merge static metadata (name, sector, streak) back into each scored stock
+    for s in scored_stocks:
+        meta = KINGS_META[s["ticker"]]
+        s["name"]        = meta["name"]
+        s["sector"]      = meta["sector"]
+        s["sectorClass"] = meta["sectorClass"]
+        s["streak"]      = meta["streak"]
+
+    winner = scored_stocks[0]
+
+    # Build JS data array
+    js_data = json.dumps(scored_stocks, indent=2)
+
+    # Compute averages for stat cards
+    avg_yield  = round(sum(s["yield"]  for s in scored_stocks) / len(scored_stocks), 2)
+    avg_streak = round(sum(s["streak"] for s in scored_stocks) / len(scored_stocks))
+    avg_cagr10 = round(sum(s["cagr10"] for s in scored_stocks) / len(scored_stocks), 1)
+    avg_pe     = round(sum(s["pe"]     for s in scored_stocks) / len(scored_stocks), 1)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🏆 American Dividend Kings — Live Report</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --gold: #f0a500; --gold-dark: #c47f00;
+    --blue: #3b82f6; --blue-light: #60a5fa;
+    --emerald: #10b981; --coral: #ef4444; --amber: #eab308;
+    --bg: #080f18; --surface: #0f1c2e; --surface2: #162338;
+    --surface3: #1e3050; --border: #1e3a52;
+    --text: #e2e8f0; --text-muted: #8ab4d4; --text-dim: #4a6a8a;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; min-height: 100vh; overflow-x: hidden; }}
+
+  /* LIVE BADGE */
+  .live-badge {{
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(74,222,128,0.12); border: 1px solid rgba(74,222,128,0.4);
+    color: #4ade80; font-size: 10px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; padding: 4px 10px; border-radius: 20px;
+    margin-bottom: 10px;
+  }}
+  .live-dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #4ade80;
+    animation: livePulse 1.5s ease-in-out infinite;
+  }}
+  @keyframes livePulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.3; }} }}
+
+  /* HEADER */
+  .header {{
+    background: linear-gradient(135deg, #0a1f38 0%, #080f18 40%, #0d1f10 100%);
+    border-bottom: 3px solid var(--gold);
+    padding: 40px 48px 32px; position: relative; overflow: hidden;
+  }}
+  .header::before {{
+    content: ''; position: absolute; top: -60px; right: -60px;
+    width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(240,165,0,0.08) 0%, transparent 70%);
+    pointer-events: none;
+  }}
+  .header-top {{ display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 20px; }}
+  .header-badge {{ font-size: 11px; letter-spacing: 3px; color: var(--gold); text-transform: uppercase; margin-bottom: 8px; }}
+  .header-title {{ font-family: 'DM Serif Display', serif; font-size: 38px; color: #fff; line-height: 1.15; }}
+  .header-subtitle {{ font-size: 13px; color: var(--text-muted); letter-spacing: 2px; text-transform: uppercase; margin-top: 6px; }}
+  .header-meta {{ text-align: right; }}
+  .meta-date {{ background: rgba(240,165,0,0.12); border: 1px solid var(--gold); border-radius: 8px; padding: 12px 20px; font-size: 13px; color: var(--gold); font-weight: 600; margin-bottom: 8px; }}
+  .meta-note {{ font-size: 11px; color: var(--text-dim); }}
+
+  /* CONTROLS */
+  .controls {{ display: flex; gap: 12px; padding: 20px 48px; background: var(--surface); border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }}
+  .controls label {{ font-size: 11px; color: var(--text-muted); letter-spacing: 1px; text-transform: uppercase; margin-right: 4px; }}
+  .controls input, .controls select {{ background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 14px; border-radius: 6px; font-size: 13px; font-family: 'Inter', sans-serif; outline: none; transition: border-color 0.2s; }}
+  .controls input:focus, .controls select:focus {{ border-color: var(--blue-light); }}
+  .controls input {{ width: 220px; }}
+  .controls select {{ cursor: pointer; }}
+  .record-count {{ margin-left: auto; font-size: 12px; color: var(--text-muted); }}
+  .record-count span {{ color: var(--gold); font-weight: 700; }}
+
+  /* CHARTS */
+  .charts-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 28px 48px; }}
+  .chart-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; position: relative; overflow: hidden; }}
+  .chart-card::before {{ content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, var(--gold), var(--blue)); }}
+  .chart-title {{ font-size: 11px; letter-spacing: 2px; color: var(--gold); text-transform: uppercase; margin-bottom: 16px; font-weight: 600; }}
+  .chart-container {{ position: relative; height: 220px; }}
+
+  /* TABLE */
+  .table-section {{ padding: 0 48px 48px; }}
+  .section-header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }}
+  .section-title {{ font-family: 'DM Serif Display', serif; font-size: 20px; color: var(--text); }}
+  .section-line {{ flex: 1; height: 1px; background: linear-gradient(90deg, var(--border), transparent); }}
+  .table-wrapper {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; -webkit-overflow-scrolling: touch; }}
+  .scroll-hint {{ display: none; text-align: center; font-size: 11px; color: var(--text-dim); padding: 6px 0 12px; letter-spacing: 1px; }}
+  table {{ width: 100%; min-width: 1200px; border-collapse: collapse; font-size: 13px; }}
+  thead th {{ background: var(--surface2); padding: 14px 16px; text-align: left; font-size: 10px; letter-spacing: 2px; color: var(--gold); text-transform: uppercase; cursor: pointer; white-space: nowrap; border-bottom: 2px solid var(--border); user-select: none; transition: background 0.15s; }}
+  thead th:hover {{ background: var(--surface3); }}
+  thead th.sorted-asc::after {{ content: ' ▲'; color: var(--blue-light); }}
+  thead th.sorted-desc::after {{ content: ' ▼'; color: var(--blue-light); }}
+  tbody tr {{ border-bottom: 1px solid var(--border); transition: background 0.12s; }}
+  tbody tr:hover {{ background: rgba(59,130,246,0.06); }}
+  tbody tr:nth-child(even) {{ background: rgba(255,255,255,0.015); }}
+  tbody tr:nth-child(even):hover {{ background: rgba(59,130,246,0.06); }}
+  tbody td {{ padding: 14px 16px; vertical-align: middle; white-space: nowrap; }}
+
+  /* CELL STYLES */
+  .ticker {{ font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 700; color: var(--blue-light); letter-spacing: 0.5px; }}
+  .ticker.best-val {{ color: #4ade80; }}
+  .company-name {{ color: var(--text); font-weight: 500; }}
+  .price {{ font-weight: 600; color: var(--text); }}
+  .change-up {{ color: var(--emerald); font-weight: 600; font-size: 12px; }}
+  .change-down {{ color: var(--coral); font-weight: 600; font-size: 12px; }}
+  .yield-high {{ background: rgba(240,165,0,0.18); color: var(--gold); font-weight: 700; padding: 3px 8px; border-radius: 4px; font-size: 12px; }}
+  .yield-normal {{ color: var(--text-muted); font-size: 12px; font-weight: 600; }}
+  .payout-ok {{ color: var(--emerald); font-weight: 700; font-size: 12px; }}
+  .payout-warn {{ color: var(--amber); font-weight: 700; font-size: 12px; }}
+  .payout-high {{ color: var(--coral); font-weight: 700; font-size: 12px; }}
+  .streak-badge {{ background: var(--surface3); color: #93c5fd; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 20px; }}
+  .pe-ok {{ color: var(--emerald); font-weight: 600; font-size: 12px; }}
+  .pe-high {{ color: var(--coral); font-weight: 600; font-size: 12px; }}
+  .pe-normal {{ color: var(--text-muted); font-weight: 600; font-size: 12px; }}
+  .sector-badge {{ font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 4px; letter-spacing: 0.5px; text-transform: uppercase; }}
+  .sector-staples {{ background: rgba(16,185,129,0.15); color: #34d399; }}
+  .sector-health {{ background: rgba(59,130,246,0.15); color: #60a5fa; }}
+  .sector-industrial {{ background: rgba(245,158,11,0.15); color: #fbbf24; }}
+  .sector-consumer {{ background: rgba(168,85,247,0.15); color: #c084fc; }}
+  .cagr-good {{ color: var(--emerald); font-weight: 600; font-size: 12px; }}
+  .cagr-ok {{ color: var(--text-muted); font-weight: 600; font-size: 12px; }}
+  .chg6m-up {{ color: var(--emerald); font-weight: 600; font-size: 12px; }}
+  .chg6m-down {{ color: var(--coral); font-weight: 600; font-size: 12px; }}
+
+  /* SMA */
+  .sma-badge-wrap {{ position: relative; display: inline-block; }}
+  .sma-bull    {{ background:rgba(16,185,129,0.15); color:#34d399; border:1px solid rgba(16,185,129,0.3); font-size:11px; font-weight:700; padding:4px 9px; border-radius:5px; white-space:nowrap; cursor:help; }}
+  .sma-bear    {{ background:rgba(239,68,68,0.15);  color:#f87171; border:1px solid rgba(239,68,68,0.3);  font-size:11px; font-weight:700; padding:4px 9px; border-radius:5px; white-space:nowrap; cursor:help; }}
+  .sma-golden  {{ background:rgba(240,165,0,0.15);  color:#fbbf24; border:1px solid rgba(240,165,0,0.4);  font-size:11px; font-weight:700; padding:4px 9px; border-radius:5px; white-space:nowrap; cursor:help; }}
+  .sma-death   {{ background:rgba(168,85,247,0.15); color:#c084fc; border:1px solid rgba(168,85,247,0.3); font-size:11px; font-weight:700; padding:4px 9px; border-radius:5px; white-space:nowrap; cursor:help; }}
+  .sma-neutral {{ background:rgba(234,179,8,0.12);  color:#eab308; border:1px solid rgba(234,179,8,0.3);  font-size:11px; font-weight:700; padding:4px 9px; border-radius:5px; white-space:nowrap; cursor:help; }}
+  .sma-tooltip {{ display:none; position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%); background:#1e3050; color:#e2e8f0; font-size:11px; padding:8px 12px; border-radius:7px; border:1px solid #3b82f6; width:200px; white-space:normal; line-height:1.5; z-index:999; box-shadow:0 4px 20px rgba(0,0,0,0.5); pointer-events:none; }}
+  .sma-badge-wrap:hover .sma-tooltip {{ display:block; }}
+
+  /* TOOLTIPS */
+  .th-wrap {{ display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }}
+  .th-info {{ display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: rgba(96,165,250,0.2); color: #60a5fa; font-size: 9px; font-weight: 700; border: 1px solid rgba(96,165,250,0.4); position: relative; cursor: help; flex-shrink: 0; }}
+  .th-info::after {{ content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #1e3050; color: #e2e8f0; font-size: 11px; font-weight: 400; letter-spacing: 0; text-transform: none; padding: 8px 12px; border-radius: 7px; border: 1px solid #3b82f6; width: 200px; white-space: normal; line-height: 1.5; pointer-events: none; opacity: 0; transition: opacity 0.18s ease; z-index: 999; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }}
+  .th-info:hover::after {{ opacity: 1; }}
+
+  /* STATS ROW */
+  .stats-row {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; padding: 0 48px 28px; }}
+  .stat-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 16px; text-align: center; position: relative; overflow: hidden; cursor: pointer; transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s; user-select: none; }}
+  .stat-card:hover {{ border-color: var(--gold); transform: translateY(-2px); box-shadow: 0 6px 24px rgba(240,165,0,0.15); }}
+  .stat-card .click-hint {{ position: absolute; top: 7px; right: 9px; font-size: 9px; color: var(--text-dim); letter-spacing: 0.5px; opacity: 0; transition: opacity 0.2s; }}
+  .stat-card:hover .click-hint {{ opacity: 1; }}
+  .stat-card::after {{ content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; }}
+  .stat-card.gold::after {{ background: var(--gold); }}
+  .stat-card.green::after {{ background: var(--emerald); }}
+  .stat-card.red::after {{ background: var(--coral); }}
+  .stat-card.blue::after {{ background: var(--blue); }}
+  .stat-card.purple::after {{ background: #a855f7; }}
+  .stat-val {{ font-family: 'DM Serif Display', serif; font-size: 28px; font-weight: 400; line-height: 1; margin-bottom: 6px; }}
+  .stat-card.gold .stat-val {{ color: var(--gold); }}
+  .stat-card.green .stat-val {{ color: var(--emerald); }}
+  .stat-card.red .stat-val {{ color: var(--coral); }}
+  .stat-card.blue .stat-val {{ color: var(--blue-light); }}
+  .stat-card.purple .stat-val {{ color: #c084fc; }}
+  .stat-label {{ font-size: 10px; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; }}
+
+  /* BEST VALUE */
+  .best-value-banner {{ margin: 28px 48px 0; background: linear-gradient(135deg, #0d2410 0%, #0f1c2e 50%, #1a1a0a 100%); border: 1.5px solid #4ade80; border-radius: 14px; padding: 20px 24px; display: flex; align-items: center; gap: 20px; cursor: pointer; position: relative; overflow: hidden; transition: transform 0.15s, box-shadow 0.2s; box-shadow: 0 0 32px rgba(74,222,128,0.08); }}
+  .best-value-banner:hover {{ transform: translateY(-2px); box-shadow: 0 8px 40px rgba(74,222,128,0.18); }}
+  .bv-crown {{ font-size: 36px; flex-shrink: 0; animation: crownPulse 2.5s ease-in-out infinite; }}
+  @keyframes crownPulse {{ 0%,100% {{ filter: drop-shadow(0 0 8px rgba(74,222,128,0.4)); }} 50% {{ filter: drop-shadow(0 0 20px rgba(74,222,128,0.8)); }} }}
+  .bv-label {{ font-size: 10px; letter-spacing: 3px; color: #4ade80; text-transform: uppercase; font-weight: 700; margin-bottom: 4px; }}
+  .bv-name {{ font-family: 'DM Serif Display', serif; font-size: 24px; color: #fff; line-height: 1.1; }}
+  .bv-ticker {{ font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #4ade80; font-weight: 700; margin-top: 2px; }}
+  .bv-scores {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }}
+  .bv-pill {{ font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px; background: rgba(74,222,128,0.12); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); white-space: nowrap; }}
+  .bv-right {{ margin-left: auto; text-align: right; flex-shrink: 0; }}
+  .bv-score-ring {{ display: inline-flex; flex-direction: column; align-items: center; justify-content: center; width: 68px; height: 68px; border-radius: 50%; border: 3px solid #4ade80; box-shadow: 0 0 20px rgba(74,222,128,0.3); background: rgba(74,222,128,0.08); }}
+  .bv-score-num {{ font-family: 'DM Serif Display', serif; font-size: 22px; color: #4ade80; line-height: 1; }}
+  .bv-score-label {{ font-size: 8px; color: #4ade80; letter-spacing: 1px; text-transform: uppercase; opacity: 0.7; }}
+  .bv-tap-hint {{ position: absolute; bottom: 10px; right: 14px; font-size: 9px; color: rgba(74,222,128,0.4); letter-spacing: 1px; text-transform: uppercase; }}
+
+  /* MODAL */
+  .modal-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); z-index: 1000; align-items: center; justify-content: center; padding: 20px; }}
+  .modal-overlay.open {{ display: flex; }}
+  .modal {{ background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 100%; max-width: 520px; max-height: 85vh; overflow-y: auto; position: relative; box-shadow: 0 24px 80px rgba(0,0,0,0.6); animation: modalIn 0.2s ease; }}
+  @keyframes modalIn {{ from {{ opacity:0; transform: scale(0.94) translateY(12px); }} to {{ opacity:1; transform: scale(1) translateY(0); }} }}
+  .modal-header {{ padding: 24px 24px 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); border-radius: 16px 16px 0 0; z-index: 1; }}
+  .modal-header-top {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }}
+  .modal-title {{ font-family: 'DM Serif Display', serif; font-size: 20px; color: var(--text); line-height: 1.2; }}
+  .modal-subtitle {{ font-size: 11px; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; margin-top: 4px; }}
+  .modal-close {{ background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); width: 32px; height: 32px; border-radius: 8px; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.15s, color 0.15s; }}
+  .modal-close:hover {{ background: var(--coral); color: #fff; border-color: var(--coral); }}
+  .modal-body {{ padding: 20px 24px 24px; }}
+  .modal-stat-hero {{ text-align: center; padding: 16px; background: var(--surface2); border-radius: 10px; margin-bottom: 20px; border: 1px solid var(--border); }}
+  .modal-stat-hero .big-val {{ font-family: 'DM Serif Display', serif; font-size: 44px; line-height: 1; margin-bottom: 4px; }}
+  .modal-stat-hero .big-label {{ font-size: 11px; color: var(--text-dim); letter-spacing: 2px; text-transform: uppercase; }}
+  .modal-stat-hero .big-desc {{ font-size: 12px; color: var(--text-muted); margin-top: 8px; line-height: 1.5; }}
+  .modal-row-list {{ display: flex; flex-direction: column; gap: 8px; }}
+  .modal-row {{ display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--surface2); border-radius: 8px; border: 1px solid var(--border); gap: 10px; transition: border-color 0.15s; }}
+  .modal-row:hover {{ border-color: var(--gold); }}
+  .modal-row-left {{ display:flex; align-items:center; gap:10px; }}
+  .modal-row-ticker {{ font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 700; color: var(--blue-light); min-width: 40px; }}
+  .modal-row-name {{ font-size: 13px; color: var(--text); }}
+  .modal-row-sub  {{ font-size: 10px; color: var(--text-dim); margin-top: 1px; }}
+  .modal-row-val  {{ font-size: 13px; font-weight: 700; white-space: nowrap; text-align:right; }}
+  .modal-section-label {{ font-size: 10px; letter-spacing: 2px; color: var(--gold); text-transform: uppercase; font-weight: 700; margin: 16px 0 8px; }}
+  .modal-bar-wrap {{ margin-top: 10px; }}
+  .modal-bar-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }}
+  .modal-bar-label {{ font-family: monospace; font-size: 12px; font-weight:700; color: var(--blue-light); min-width:36px; }}
+  .modal-bar-track {{ flex:1; background: var(--surface3); border-radius:4px; height:8px; overflow:hidden; }}
+  .modal-bar-fill  {{ height:8px; border-radius:4px; transition: width 0.5s ease; }}
+  .modal-bar-num   {{ font-size: 12px; font-weight:700; min-width:44px; text-align:right; }}
+
+  /* FOOTER */
+  .footer {{ background: var(--surface); border-top: 1px solid var(--border); padding: 28px 48px; text-align: center; }}
+  .footer p {{ font-size: 11px; color: var(--text-dim); line-height: 1.7; max-width: 800px; margin: 0 auto; }}
+  .footer strong {{ color: var(--text-muted); }}
+
+  @media (max-width: 768px) {{
+    .header {{ padding: 24px 16px; }}
+    .header-title {{ font-size: 26px; }}
+    .stats-row {{ grid-template-columns: repeat(3, 1fr); padding: 0 16px 20px; }}
+    .charts-grid {{ grid-template-columns: 1fr; padding: 16px; }}
+    .table-section {{ padding: 0 16px 32px; }}
+    .controls {{ padding: 12px 16px; }}
+    .controls input {{ width: 160px; }}
+    .best-value-banner {{ margin: 20px 16px 0; padding: 16px; gap: 14px; }}
+    .bv-name {{ font-size: 20px; }}
+    .scroll-hint {{ display: block; }}
+    .footer {{ padding: 20px 16px; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div>
+      <div class="live-badge"><div class="live-dot"></div> Live Data</div>
+      <div class="header-badge">📊 Full Analytical Report · Market Intelligence</div>
+      <div class="header-title">🏆 American Dividend Kings</div>
+      <div class="header-subtitle">50+ Years of Consecutive Dividend Growth</div>
+    </div>
+    <div class="header-meta">
+      <div class="meta-date">📅 {run_date}</div>
+      <div class="meta-note" style="color:#4ade80;">● Data via Yahoo Finance</div>
+      <div class="meta-note" style="margin-top:4px;">Updated: {run_ts} UTC</div>
+    </div>
+  </div>
+</div>
+
+<div class="best-value-banner" id="bestValueBanner" onclick="openModal('bestvalue')">
+  <div class="bv-crown">🏅</div>
+  <div style="flex:1; min-width:0;">
+    <div class="bv-label">⭐ Best Value Pick · Composite Score</div>
+    <div class="bv-name" id="bvName">—</div>
+    <div class="bv-ticker" id="bvTicker">Loading...</div>
+    <div class="bv-scores" id="bvPills"></div>
+  </div>
+  <div class="bv-right">
+    <div class="bv-score-ring">
+      <div class="bv-score-num" id="bvScore">—</div>
+      <div class="bv-score-label">Score</div>
+    </div>
+  </div>
+  <div class="bv-tap-hint">CLICK FOR ANALYSIS</div>
+</div>
+
+<div class="stats-row" style="padding-top:28px;">
+  <div class="stat-card gold" onclick="openModal('kings')">
+    <span class="click-hint">TAP FOR DETAILS</span>
+    <div class="stat-val">10</div>
+    <div class="stat-label">Kings Tracked</div>
+  </div>
+  <div class="stat-card green" onclick="openModal('yield')">
+    <span class="click-hint">TAP FOR DETAILS</span>
+    <div class="stat-val" id="cardYield">{avg_yield}%</div>
+    <div class="stat-label">Avg. Yield</div>
+  </div>
+  <div class="stat-card blue" onclick="openModal('streak')">
+    <span class="click-hint">TAP FOR DETAILS</span>
+    <div class="stat-val" id="cardStreak">{avg_streak} yrs</div>
+    <div class="stat-label">Avg. Streak</div>
+  </div>
+  <div class="stat-card purple" onclick="openModal('cagr')">
+    <span class="click-hint">TAP FOR DETAILS</span>
+    <div class="stat-val" id="cardCagr">{avg_cagr10}%</div>
+    <div class="stat-label">Avg. Growth Factor</div>
+  </div>
+  <div class="stat-card red" onclick="openModal('pe')">
+    <span class="click-hint">TAP FOR DETAILS</span>
+    <div class="stat-val" id="cardPe">{avg_pe}×</div>
+    <div class="stat-label">Avg. P/E Ratio</div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modalOverlay" onclick="closeModalOnBg(event)">
+  <div class="modal" id="modalBox">
+    <div class="modal-header">
+      <div class="modal-header-top">
+        <div>
+          <div class="modal-title" id="modalTitle"></div>
+          <div class="modal-subtitle" id="modalSubtitle"></div>
+        </div>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<div class="charts-grid">
+  <div class="chart-card">
+    <div class="chart-title">Dividend Yield by Company</div>
+    <div class="chart-container"><canvas id="yieldChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Sector Breakdown</div>
+    <div class="chart-container"><canvas id="sectorChart"></canvas></div>
+  </div>
+</div>
+
+<div class="charts-grid" style="grid-template-columns:1fr; padding-top:0;">
+  <div class="chart-card" style="border-top: 3px solid var(--gold);">
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+      <div>
+        <div class="chart-title" style="margin-bottom:4px;">📈 Dividend Growth Comparison</div>
+        <div style="font-size:11px; color:var(--text-dim);">Select up to 5 stocks to compare historical dividend growth side by side</div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button onclick="toggleNormalized()" id="normBtn" style="background:var(--surface3);border:1px solid var(--border);color:var(--text-muted);padding:6px 12px;border-radius:6px;font-size:11px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;transition:all 0.2s;">Show % Growth</button>
+        <button onclick="clearComparison()" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;padding:6px 12px;border-radius:6px;font-size:11px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;">Clear All</button>
+      </div>
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px;" id="tickerButtons"></div>
+    <div style="position:relative; height:300px;"><canvas id="compareChart"></canvas></div>
+    <div style="margin-top:12px; font-size:11px; color:var(--text-dim); text-align:center;" id="compareHint">Click tickers above to add them to the comparison.</div>
+  </div>
+</div>
+
+<div class="controls">
+  <label>🔍 Search</label>
+  <input type="text" id="searchInput" placeholder="Ticker or company name..." oninput="applyFilters()">
+  <label>Sector</label>
+  <select id="sectorFilter" onchange="applyFilters()">
+    <option value="">All Sectors</option>
+    <option value="Consumer Staples">Consumer Staples</option>
+    <option value="Healthcare">Healthcare</option>
+    <option value="Industrials">Industrials</option>
+    <option value="Consumer Discretionary">Consumer Discretionary</option>
+    <option value="Food Service">Food Service</option>
+  </select>
+  <div class="record-count">Showing <span id="rowCount">10</span> of 10 companies</div>
+</div>
+
+<div class="table-section">
+  <div class="section-header">
+    <div class="section-title">Full Data Table</div>
+    <div class="section-line"></div>
+  </div>
+  <div class="scroll-hint">← Swipe to see all columns →</div>
+  <div class="table-wrapper">
+    <table id="mainTable">
+      <thead><tr>
+        <th onclick="sortTable(0)"><span class="th-wrap">Ticker <span class="th-info" data-tip="The stock's unique exchange symbol.">?</span></span></th>
+        <th onclick="sortTable(1)"><span class="th-wrap">Company <span class="th-info" data-tip="Full company name.">?</span></span></th>
+        <th onclick="sortTable(2)"><span class="th-wrap">Sector <span class="th-info" data-tip="The broad industry category.">?</span></span></th>
+        <th onclick="sortTable(3)" style="text-align:right;"><span class="th-wrap">Price <span class="th-info" data-tip="Current share price in USD.">?</span></span></th>
+        <th onclick="sortTable(4)" style="text-align:right;"><span class="th-wrap">Chg % <span class="th-info" data-tip="Today's price change vs yesterday's close.">?</span></span></th>
+        <th onclick="sortTable(5)" style="text-align:right;"><span class="th-wrap">Yield <span class="th-info" data-tip="Annual dividend ÷ price. ★ = above 3%.">?</span></span></th>
+        <th onclick="sortTable(6)" style="text-align:right;"><span class="th-wrap">Payout <span class="th-info" data-tip="% of earnings paid as dividends. Green &lt;60%, Amber 60-80%, Red &gt;80%.">?</span></span></th>
+        <th onclick="sortTable(7)" style="text-align:right;"><span class="th-wrap">Streak <span class="th-info" data-tip="Consecutive years of dividend increases. 50+ = Dividend King.">?</span></span></th>
+        <th onclick="sortTable(8)" style="text-align:right;"><span class="th-wrap">5Y CAGR <span class="th-info" data-tip="5-year dividend compound annual growth rate.">?</span></span></th>
+        <th onclick="sortTable(9)" style="text-align:right;"><span class="th-wrap">10Y CAGR <span class="th-info" data-tip="10-year dividend compound annual growth rate.">?</span></span></th>
+        <th onclick="sortTable(10)" style="text-align:right;"><span class="th-wrap">P/E <span class="th-info" data-tip="Price ÷ Earnings. Green &lt;20×, Amber 20-30×, Red &gt;30×.">?</span></span></th>
+        <th onclick="sortTable(11)" style="text-align:right;"><span class="th-wrap">P/S <span class="th-info" data-tip="Price-to-Sales ratio. Lower = better value.">?</span></span></th>
+        <th onclick="sortTable(12)" style="text-align:right;"><span class="th-wrap">6M Chg <span class="th-info" data-tip="Price change over the past 6 months.">?</span></span></th>
+        <th onclick="sortTable(13)" style="text-align:right;"><span class="th-wrap">SMA Signal <span class="th-info" data-tip="Trend signal based on 50-day and 200-day moving averages.">?</span></span></th>
+        <th onclick="sortTable(14)" style="text-align:right;"><span class="th-wrap">Mkt Cap <span class="th-info" data-tip="Total market value in billions USD.">?</span></span></th>
+        <th onclick="sortTable(15)" style="text-align:right;"><span class="th-wrap">Ann. Div <span class="th-info" data-tip="Annual dividend per share in USD.">?</span></span></th>
+        <th onclick="sortTable(16)" style="text-align:right;"><span class="th-wrap">EPS <span class="th-info" data-tip="Earnings per share.">?</span></span></th>
+        <th onclick="sortTable(17)" style="text-align:right;"><span class="th-wrap">EPS Gr. <span class="th-info" data-tip="EPS growth (3Y CAGR). Green ≥8%, Amber 3-8%, Red &lt;3%.">?</span></span></th>
+        <th onclick="sortTable(18)" style="text-align:right;"><span class="th-wrap">Rev Gr. <span class="th-info" data-tip="Revenue growth (3Y CAGR). Green ≥6%, Amber 2-6%, Red &lt;2%.">?</span></span></th>
+        <th onclick="sortTable(19)" style="text-align:right;"><span class="th-wrap">Beta <span class="th-info" data-tip="Volatility vs market. &lt;1 = defensive, &gt;1 = more volatile.">?</span></span></th>
+        <th onclick="sortTable(20)" style="text-align:right;"><span class="th-wrap">52W Range <span class="th-info" data-tip="52-week price range with current price indicator.">?</span></span></th>
+      </tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="footer">
+  <p>
+    <strong>⚠️ Disclaimer:</strong> For <strong>informational purposes only</strong>. Data sourced from Yahoo Finance via yfinance and may be delayed or inaccurate. Not financial advice. Past dividend performance does not guarantee future results.<br><br>
+    Auto-generated by GitHub Actions · Data: Yahoo Finance · Updated {run_ts} UTC · © Dividend Kings Report
+  </p>
+</div>
+
+<script>
+// ── LIVE DATA (injected by generate_site.py) ──────────────────────────────────
+const data = {js_data};
+
+// Dividend history for comparison chart (static — updated annually)
+const divHistory = {{
+  labels: ['2015','2016','2017','2018','2019','2020','2021','2022','2023','2024','2025'],
+  KO:  [1.32,1.40,1.48,1.56,1.60,1.64,1.68,1.76,1.84,1.92,1.94],
+  PG:  [2.59,2.66,2.70,2.79,2.90,3.16,3.24,3.48,3.65,3.88,4.10],
+  JNJ: [3.00,3.15,3.32,3.54,3.75,4.04,4.24,4.52,4.70,4.96,5.10],
+  MMM: [4.10,4.44,4.70,5.44,5.76,5.88,5.92,5.96,6.00,7.00,7.78],
+  CL:  [1.55,1.60,1.63,1.68,1.72,1.76,1.80,1.88,1.96,2.12,2.28],
+  EMR: [1.92,1.96,1.99,1.99,2.00,2.00,2.00,2.06,2.10,2.16,2.23],
+  GPC: [2.63,2.70,2.76,2.88,3.05,3.26,3.26,3.58,3.80,4.02,4.18],
+  LOW: [0.92,1.10,1.40,1.74,2.00,2.20,3.00,3.55,4.00,4.20,4.30],
+  SYY: [1.16,1.22,1.28,1.40,1.56,1.72,1.82,1.92,2.00,2.12,2.23],
+  ABT: [1.00,1.04,1.06,1.12,1.32,1.44,1.80,2.04,2.20,2.28,2.40],
+}};
+
+// ── SMA SIGNAL ────────────────────────────────────────────────────────────────
+function smaSignal(d) {{
+  const {{ price, sma50, sma200 }} = d;
+  const gap = ((sma50 - sma200) / sma200) * 100;
+  if (price > sma50 && sma50 > sma200)              return {{ label:'🟢 Bullish',      cls:'sma-bull',    tip:`Price $${{price}} > SMA50 $${{sma50}} > SMA200 $${{sma200}}. Strong uptrend.` }};
+  if (price < sma50 && sma50 < sma200)              return {{ label:'🔴 Bearish',      cls:'sma-bear',    tip:`Price $${{price}} < SMA50 $${{sma50}} < SMA200 $${{sma200}}. Downtrend confirmed.` }};
+  if (sma50 > sma200 && gap < 2 && price > sma50)  return {{ label:'✨ Golden Cross', cls:'sma-golden',  tip:`SMA50 $${{sma50}} recently crossed above SMA200 $${{sma200}}. Long-term buy signal.` }};
+  if (sma50 < sma200 && gap > -2 && price < sma50) return {{ label:'💀 Death Cross',  cls:'sma-death',   tip:`SMA50 $${{sma50}} recently crossed below SMA200 $${{sma200}}. Long-term sell signal.` }};
+  return {{ label:'🟡 Neutral', cls:'sma-neutral', tip:`Price $${{price}}, SMA50 $${{sma50}}, SMA200 $${{sma200}}. No clear trend.` }};
+}}
+
+// ── TABLE ─────────────────────────────────────────────────────────────────────
+let sortCol = -1, sortAsc = true;
+const winner = data[0]; // already sorted best→worst by Python
+
+function renderTable(rows) {{
+  document.getElementById('tableBody').innerHTML = rows.map(d => {{
+    const sma = smaSignal(d);
+    const pct52 = (((d.price - d.w52lo) / (d.w52hi - d.w52lo)) * 100).toFixed(0);
+    const isWinner = d.ticker === winner.ticker;
+    return `<tr${{isWinner ? ' style="background:rgba(74,222,128,0.05);"' : ''}}>
+      <td><span class="ticker${{isWinner?' best-val':''}}">${{d.ticker}}${{isWinner?' ★':''}}</span></td>
+      <td><div class="company-name">${{d.name}}</div></td>
+      <td><span class="sector-badge sector-${{d.sectorClass}}">${{d.sector}}</span></td>
+      <td style="text-align:right;"><span class="price">$${{d.price.toFixed(2)}}</span></td>
+      <td style="text-align:right;"><span class="${{d.chg>=0?'change-up':'change-down'}}">${{d.chg>=0?'▲':'▼'}} ${{Math.abs(d.chg).toFixed(2)}}%</span></td>
+      <td style="text-align:right;">${{d.yield>=3?`<span class="yield-high">★ ${{d.yield.toFixed(2)}}%</span>`:`<span class="yield-normal">${{d.yield.toFixed(2)}}%</span>`}}</td>
+      <td style="text-align:right;"><span class="${{d.payout<60?'payout-ok':d.payout<=80?'payout-warn':'payout-high'}}">● ${{d.payout}}%</span></td>
+      <td style="text-align:right;"><span class="streak-badge">${{d.streak}} yrs</span></td>
+      <td style="text-align:right;"><span class="${{d.cagr5>=5?'cagr-good':'cagr-ok'}}">${{d.cagr5.toFixed(1)}}%</span></td>
+      <td style="text-align:right;"><span class="${{d.cagr10>=6?'cagr-good':'cagr-ok'}}">${{d.cagr10.toFixed(1)}}%</span></td>
+      <td style="text-align:right;"><span class="${{d.pe<20?'pe-ok':d.pe>30?'pe-high':'pe-normal'}}">${{d.pe.toFixed(1)}}×</span></td>
+      <td style="text-align:right;"><span class="pe-normal">${{d.ps.toFixed(1)}}×</span></td>
+      <td style="text-align:right;"><span class="${{d.chg6m>=0?'chg6m-up':'chg6m-down'}}">${{d.chg6m>=0?'▲':'▼'}} ${{Math.abs(d.chg6m).toFixed(1)}}%</span></td>
+      <td style="text-align:right;"><span class="sma-badge-wrap"><span class="${{sma.cls}}">${{sma.label}}</span><span class="sma-tooltip">${{sma.tip}}</span></span></td>
+      <td style="text-align:right;"><span style="color:var(--text-muted);font-size:12px;font-weight:600;">$${{d.mktcap.toFixed(1)}}B</span></td>
+      <td style="text-align:right;"><span style="color:var(--text-muted);font-size:12px;font-weight:600;">$${{d.annDiv.toFixed(2)}}</span></td>
+      <td style="text-align:right;"><span style="color:var(--text-muted);font-size:12px;font-weight:600;">$${{d.eps.toFixed(2)}}</span></td>
+      <td style="text-align:right;"><span style="color:${{d.epsGrowth>=8?'var(--emerald)':d.epsGrowth>=3?'var(--amber)':'var(--coral)'}};font-size:12px;font-weight:700;">${{d.epsGrowth>=0?'+':''}}${{d.epsGrowth.toFixed(1)}}%</span></td>
+      <td style="text-align:right;"><span style="color:${{d.revGrowth>=6?'var(--emerald)':d.revGrowth>=2?'var(--amber)':'var(--coral)'}};font-size:12px;font-weight:700;">${{d.revGrowth>=0?'+':''}}${{d.revGrowth.toFixed(1)}}%</span></td>
+      <td style="text-align:right;"><span style="color:${{d.beta<0.7?'var(--emerald)':d.beta>1?'var(--coral)':'var(--amber)'}};font-size:12px;font-weight:700;">${{d.beta.toFixed(2)}}</span></td>
+      <td style="text-align:right;">
+        <div style="font-size:11px;color:var(--text-muted);">$${{d.w52lo}}–$${{d.w52hi}}</div>
+        <div style="margin-top:4px;background:var(--surface3);border-radius:3px;height:4px;width:80px;display:inline-block;position:relative;overflow:hidden;">
+          <div style="position:absolute;left:${{pct52}}%;top:0;width:6px;height:4px;background:var(--gold);border-radius:2px;transform:translateX(-50%);"></div>
+        </div>
+      </td>
+    </tr>`;
+  }}).join('');
+  document.getElementById('rowCount').textContent = rows.length;
+}}
+
+function applyFilters() {{
+  const q = document.getElementById('searchInput').value.toLowerCase();
+  const sector = document.getElementById('sectorFilter').value;
+  let filtered = data.filter(d => (!q || d.ticker.toLowerCase().includes(q) || d.name.toLowerCase().includes(q)) && (!sector || d.sector === sector));
+  if (sortCol >= 0) filtered = sortData(filtered, sortCol, sortAsc);
+  renderTable(filtered);
+}}
+
+const colKeys = ['ticker','name','sector','price','chg','yield','payout','streak','cagr5','cagr10','pe','ps','chg6m','sma50','mktcap','annDiv','eps','epsGrowth','revGrowth','beta','w52lo'];
+function sortData(rows, col, asc) {{
+  return [...rows].sort((a,b) => {{
+    let va = a[colKeys[col]], vb = b[colKeys[col]];
+    if (typeof va === 'string') return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    return asc ? va - vb : vb - va;
+  }});
+}}
+function sortTable(col) {{
+  sortAsc = (sortCol === col) ? !sortAsc : true; sortCol = col;
+  document.querySelectorAll('thead th').forEach((th,i) => {{
+    th.classList.remove('sorted-asc','sorted-desc');
+    if (i === col) th.classList.add(sortAsc ? 'sorted-asc' : 'sorted-desc');
+  }});
+  applyFilters();
+}}
+renderTable(data);
+
+// ── CHARTS ────────────────────────────────────────────────────────────────────
+const sortedByYield = [...data].sort((a,b) => b.yield - a.yield);
+new Chart(document.getElementById('yieldChart'), {{
+  type: 'bar',
+  data: {{ labels: sortedByYield.map(d=>d.ticker), datasets:[{{ data: sortedByYield.map(d=>d.yield), backgroundColor: sortedByYield.map(d=>d.yield>=3?'rgba(240,165,0,0.75)':'rgba(59,130,246,0.55)'), borderColor: sortedByYield.map(d=>d.yield>=3?'#f0a500':'#3b82f6'), borderWidth:1.5, borderRadius:5 }}] }},
+  options: {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{display:false}}, tooltip:{{ callbacks:{{ label: ctx=>`${{ctx.parsed.y.toFixed(2)}}%` }} }} }}, scales:{{ x:{{ ticks:{{color:'#8ab4d4',font:{{size:11}}}}, grid:{{color:'rgba(255,255,255,0.04)'}} }}, y:{{ ticks:{{color:'#8ab4d4',font:{{size:10}},callback:v=>v+'%'}}, grid:{{color:'rgba(255,255,255,0.06)'}}, beginAtZero:true }} }} }}
+}});
+
+const sectorCounts = {{}};
+data.forEach(d => {{ sectorCounts[d.sector] = (sectorCounts[d.sector]||0) + 1; }});
+new Chart(document.getElementById('sectorChart'), {{
+  type: 'doughnut',
+  data: {{ labels: Object.keys(sectorCounts), datasets:[{{ data: Object.values(sectorCounts), backgroundColor:['rgba(16,185,129,0.7)','rgba(59,130,246,0.7)','rgba(245,158,11,0.7)','rgba(168,85,247,0.7)','rgba(239,68,68,0.7)'], borderColor:['#10b981','#3b82f6','#f59e0b','#a855f7','#ef4444'], borderWidth:2 }}] }},
+  options: {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{ position:'bottom', labels:{{color:'#8ab4d4',font:{{size:11}},padding:10,boxWidth:12}} }}, tooltip:{{ callbacks:{{ label: ctx=>`${{ctx.label}}: ${{ctx.parsed}} co.` }} }} }} }}
+}});
+
+// ── COMPARISON CHART ──────────────────────────────────────────────────────────
+const compareColors = ['#f0a500','#3b82f6','#10b981','#ef4444','#a855f7','#f97316','#06b6d4','#84cc16','#ec4899','#8b5cf6'];
+let selectedTickers = ['KO','JNJ'], normalizedMode = false, compareChartInstance = null;
+
+function buildTickerButtons() {{
+  document.getElementById('tickerButtons').innerHTML = data.map((d,i) => `
+    <button onclick="toggleTicker('${{d.ticker}}')" id="btn-${{d.ticker}}"
+      style="padding:5px 12px;border-radius:20px;font-size:11px;font-weight:700;font-family:monospace;cursor:pointer;transition:all 0.15s;border:2px solid ${{compareColors[i]}};background:${{selectedTickers.includes(d.ticker)?compareColors[i]+'33':'transparent'}};color:${{compareColors[i]}};">
+      ${{d.ticker}}
+    </button>`).join('');
+}}
+function toggleTicker(ticker) {{
+  if (selectedTickers.includes(ticker)) {{
+    if (selectedTickers.length === 1) return;
+    selectedTickers = selectedTickers.filter(t => t !== ticker);
+  }} else {{
+    if (selectedTickers.length >= 5) {{ document.getElementById('compareHint').textContent = '⚠️ Max 5 stocks.'; setTimeout(()=>{{ document.getElementById('compareHint').textContent=''; }},2000); return; }}
+    selectedTickers.push(ticker);
+  }}
+  buildTickerButtons(); renderCompareChart();
+}}
+function clearComparison() {{ selectedTickers = ['KO']; buildTickerButtons(); renderCompareChart(); }}
+function toggleNormalized() {{
+  normalizedMode = !normalizedMode;
+  const btn = document.getElementById('normBtn');
+  btn.style.background = normalizedMode ? 'rgba(59,130,246,0.2)' : 'var(--surface3)';
+  btn.style.borderColor = normalizedMode ? '#3b82f6' : 'var(--border)';
+  btn.style.color = normalizedMode ? '#60a5fa' : 'var(--text-muted)';
+  btn.textContent = normalizedMode ? '✓ % Growth Mode' : 'Show % Growth';
+  renderCompareChart();
+}}
+function renderCompareChart() {{
+  document.getElementById('compareHint').textContent = normalizedMode ? 'Normalized to 100 at 2015 — shows relative % growth.' : 'Showing absolute annual dividend per share in USD.';
+  const datasets = selectedTickers.map((ticker, i) => {{
+    const ci = data.findIndex(d => d.ticker === ticker);
+    const color = compareColors[ci];
+    const raw = divHistory[ticker];
+    const chartData = normalizedMode ? raw.map(v => +((v/raw[0]*100).toFixed(2))) : raw;
+    return {{ label: ticker, data: chartData, borderColor: color, backgroundColor: color+'15', pointBackgroundColor: color, pointRadius:4, pointHoverRadius:7, tension:0.3, fill:false, borderWidth:2.5 }};
+  }});
+  if (compareChartInstance) compareChartInstance.destroy();
+  compareChartInstance = new Chart(document.getElementById('compareChart'), {{
+    type: 'line',
+    data: {{ labels: divHistory.labels, datasets }},
+    options: {{ responsive:true, maintainAspectRatio:false, interaction:{{mode:'index',intersect:false}}, plugins:{{ legend:{{position:'top',labels:{{color:'#8ab4d4',font:{{size:12}},padding:16,boxWidth:14}}}}, tooltip:{{callbacks:{{label: ctx => normalizedMode ? ` ${{ctx.dataset.label}}: ${{ctx.parsed.y.toFixed(1)}} (${{(ctx.parsed.y-100).toFixed(1)}}% growth)` : ` ${{ctx.dataset.label}}: $${{ctx.parsed.y.toFixed(2)}}/sh`}}}} }}, scales:{{ x:{{ticks:{{color:'#8ab4d4',font:{{size:11}}}},grid:{{color:'rgba(255,255,255,0.04)'}}}}, y:{{ticks:{{color:'#8ab4d4',font:{{size:10}},callback: v => normalizedMode?v+'%':'$'+v.toFixed(2)}},grid:{{color:'rgba(255,255,255,0.06)'}}}} }} }}
+  }});
+}}
+buildTickerButtons(); renderCompareChart();
+
+// ── BEST VALUE BANNER ─────────────────────────────────────────────────────────
+const bv = data[0];
+document.getElementById('bvName').textContent  = bv.name;
+document.getElementById('bvTicker').textContent = `${{bv.ticker}} · $${{bv.price.toFixed(2)}} · ${{bv.sector}}`;
+document.getElementById('bvScore').textContent  = bv.composite;
+document.getElementById('bvPills').innerHTML = bv.breakdown
+  .sort((a,b)=>b.score-a.score).slice(0,3)
+  .map(c=>`<span class="bv-pill">${{c.label}}: ${{c.score.toFixed(1)}}/10</span>`).join('');
+
+// ── MODAL SYSTEM ──────────────────────────────────────────────────────────────
+function gc(v) {{ return v>=7?'var(--emerald)':v>=4?'var(--amber)':'var(--coral)'; }}
+function gl(v) {{ return v>=7?'Excellent':v>=4?'Fair':'Weak'; }}
+
+function openModal(type) {{
+  const overlay = document.getElementById('modalOverlay');
+  const title   = document.getElementById('modalTitle');
+  const subtitle= document.getElementById('modalSubtitle');
+  const body    = document.getElementById('modalBody');
+
+  if (type === 'bestvalue') {{
+    const w = bv;
+    title.textContent = `🏅 Best Value: ${{w.name}}`;
+    subtitle.textContent = `COMPOSITE SCORE: ${{w.composite}}/100 · ${{w.ticker}} · ${{w.sector.toUpperCase()}}`;
+    body.innerHTML = `
+      <div style="font-size:10px;letter-spacing:2px;color:#4ade80;text-transform:uppercase;font-weight:700;margin-bottom:12px;">Score breakdown</div>
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px;">
+        ${{w.breakdown.map(c => `
+          <div style="background:#162338;border:1px solid #1e3a52;border-radius:10px;padding:14px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;">
+              <div style="font-size:13px;font-weight:600;color:#e2e8f0;">${{c.label}}</div>
+              <div style="font-size:10px;color:#4a6a8a;font-weight:400;white-space:nowrap;">weight ${{c.weight}}%</div>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;">
+              <div style="font-family:monospace;font-size:12px;font-weight:700;color:${{gc(c.score)}};flex:1;">${{c.label}}</div>
+              <div style="font-size:10px;color:${{gc(c.score)}};font-weight:700;white-space:nowrap;">${{gl(c.score)}}</div>
+            </div>
+            <div style="background:#1e3050;border-radius:4px;height:6px;margin-bottom:8px;overflow:hidden;">
+              <div style="width:${{c.score*10}}%;height:6px;background:${{gc(c.score)}};border-radius:4px;"></div>
+            </div>
+          </div>`).join('')}}
+      </div>
+      <div style="font-size:10px;letter-spacing:2px;color:#f0a500;text-transform:uppercase;font-weight:700;margin-bottom:10px;">Full Leaderboard</div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:20px;">
+        ${{data.map((d,i)=>`
+          <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:${{i===0?'rgba(74,222,128,0.08)':'#162338'}};border:1px solid ${{i===0?'rgba(74,222,128,0.4)':'#1e3a52'}};border-radius:8px;">
+            <div style="font-size:12px;color:#4a6a8a;min-width:20px;">#${{i+1}}</div>
+            <div style="font-family:monospace;font-size:13px;font-weight:700;color:${{i===0?'#4ade80':'#60a5fa'}};min-width:40px;">${{d.ticker}}</div>
+            <div style="font-size:12px;color:#e2e8f0;flex:1;">${{d.name}}</div>
+            <div style="font-size:14px;font-weight:700;color:${{i===0?'#4ade80':'#8ab4d4'}};">${{d.composite}}</div>
+          </div>`).join('')}}
+      </div>
+      <div style="font-size:10px;color:#4a6a8a;line-height:1.6;padding:12px;background:#0d1a26;border-radius:8px;">
+        ⚠️ <strong style="color:#f0a500;">Methodology:</strong> Growth Factor 25% · P/E 20% · Yield 18% · Payout 15% · SMA 12% · Beta 10%. Quantitative only — not investment advice.
+      </div>`;
+  }}
+
+  else if (type === 'kings') {{
+    title.textContent = '👑 The 10 Dividend Kings';
+    subtitle.textContent = '50+ consecutive years of dividend increases';
+    const sorted = [...data].sort((a,b)=>b.streak-a.streak);
+    body.innerHTML = `
+      <div class="modal-stat-hero">
+        <div class="big-val" style="color:var(--gold);">50+</div>
+        <div class="big-label">Years Required</div>
+        <div class="big-desc">A Dividend King has raised its annual dividend every year for at least 50 consecutive years — the highest standard of dividend royalty.</div>
+      </div>
+      <div class="modal-row-list">${{sorted.map(d=>`
+        <div class="modal-row">
+          <div class="modal-row-left"><div class="modal-row-ticker">${{d.ticker}}</div><div>
+            <div class="modal-row-name">${{d.name}}</div>
+            <div class="modal-row-sub">Raising since ~${{2026-d.streak}} · ${{d.sector}}</div>
+          </div></div>
+          <div class="modal-row-val" style="color:var(--gold);">${{d.streak}} yrs</div>
+        </div>`).join('')}}
+      </div>`;
+  }}
+
+  else if (type === 'yield') {{
+    const avg = (data.reduce((s,d)=>s+d.yield,0)/data.length).toFixed(2);
+    const maxY = Math.max(...data.map(d=>d.yield));
+    const sorted = [...data].sort((a,b)=>b.yield-a.yield);
+    title.textContent = '💰 Dividend Yield Rankings';
+    subtitle.textContent = 'Income per dollar invested';
+    body.innerHTML = `
+      <div class="modal-stat-hero">
+        <div class="big-val" style="color:var(--emerald);">${{avg}}%</div>
+        <div class="big-label">Average Yield</div>
+        <div class="big-desc">A $10,000 investment across all 10 Kings equally would generate ~<strong style="color:var(--emerald);">$${{(10000*parseFloat(avg)/100).toFixed(0)}}/year</strong> in dividends.</div>
+      </div>
+      <div class="modal-bar-wrap">${{sorted.map(d=>`
+        <div class="modal-bar-row">
+          <div class="modal-bar-label">${{d.ticker}}</div>
+          <div class="modal-bar-track"><div class="modal-bar-fill" style="width:${{(d.yield/maxY*100).toFixed(0)}}%;background:${{d.yield>=3?'var(--gold)':'var(--blue)'}};"></div></div>
+          <div class="modal-bar-num" style="color:${{d.yield>=3?'var(--gold)':'var(--blue-light)'}}">${{d.yield>=3?'★ ':''}}${{d.yield.toFixed(2)}}%</div>
+        </div>`).join('')}}
+      </div>`;
+  }}
+
+  else if (type === 'streak') {{
+    const avg = Math.round(data.reduce((s,d)=>s+d.streak,0)/data.length);
+    const maxS = Math.max(...data.map(d=>d.streak));
+    const sorted = [...data].sort((a,b)=>b.streak-a.streak);
+    title.textContent = '📅 Dividend Streak Rankings';
+    subtitle.textContent = 'Consecutive years of dividend increases';
+    body.innerHTML = `
+      <div class="modal-stat-hero">
+        <div class="big-val" style="color:var(--blue-light);">${{avg}} yrs</div>
+        <div class="big-label">Average Streak</div>
+        <div class="big-desc">The average King has been raising its dividend for ${{avg}} years — through recessions, crises, and market cycles.</div>
+      </div>
+      <div class="modal-bar-wrap">${{sorted.map(d=>`
+        <div class="modal-bar-row">
+          <div class="modal-bar-label">${{d.ticker}}</div>
+          <div class="modal-bar-track"><div class="modal-bar-fill" style="width:${{(d.streak/maxS*100).toFixed(0)}}%;background:var(--blue-light);"></div></div>
+          <div class="modal-bar-num" style="color:var(--blue-light);">${{d.streak}} yrs</div>
+        </div>`).join('')}}
+      </div>`;
+  }}
+
+  else if (type === 'cagr') {{
+    const avg5  = (data.reduce((s,d)=>s+d.cagr5,0)/data.length).toFixed(1);
+    const avg10 = (data.reduce((s,d)=>s+d.cagr10,0)/data.length).toFixed(1);
+    const avgEps = (data.reduce((s,d)=>s+d.epsGrowth,0)/data.length).toFixed(1);
+    const avgRev = (data.reduce((s,d)=>s+d.revGrowth,0)/data.length).toFixed(1);
+    const maxC = Math.max(...data.map(d=>d.cagr10));
+    const sorted = [...data].sort((a,b)=>b.cagr10-a.cagr10);
+    title.textContent = '📈 Growth Breakdown';
+    subtitle.textContent = 'Dividend CAGR · EPS Growth · Revenue Growth';
+    body.innerHTML = `
+      <div class="modal-stat-hero">
+        <div style="display:flex;gap:14px;justify-content:center;align-items:center;flex-wrap:wrap;">
+          <div style="text-align:center;"><div class="big-val" style="color:#c084fc;font-size:30px;">${{avg5}}%</div><div class="big-label">Div 5Y CAGR</div></div>
+          <div style="width:1px;height:40px;background:var(--border);"></div>
+          <div style="text-align:center;"><div class="big-val" style="color:#c084fc;font-size:30px;">${{avg10}}%</div><div class="big-label">Div 10Y CAGR</div></div>
+          <div style="width:1px;height:40px;background:var(--border);"></div>
+          <div style="text-align:center;"><div class="big-val" style="color:var(--emerald);font-size:30px;">+${{avgEps}}%</div><div class="big-label">Avg EPS Gr.</div></div>
+          <div style="width:1px;height:40px;background:var(--border);"></div>
+          <div style="text-align:center;"><div class="big-val" style="color:var(--blue-light);font-size:30px;">+${{avgRev}}%</div><div class="big-label">Avg Rev Gr.</div></div>
+        </div>
+        <div class="big-desc" style="margin-top:12px;">A ${{avg10}}% CAGR means dividends double every ~<strong style="color:#c084fc;">${{Math.round(72/parseFloat(avg10))}} years</strong>.</div>
+      </div>
+      <div class="modal-section-label">10Y Div CAGR · Acceleration</div>
+      <div class="modal-bar-wrap">${{sorted.map(d=>`
+        <div class="modal-bar-row">
+          <div class="modal-bar-label">${{d.ticker}}</div>
+          <div class="modal-bar-track"><div class="modal-bar-fill" style="width:${{(d.cagr10/maxC*100).toFixed(0)}}%;background:#a855f7;"></div></div>
+          <div class="modal-bar-num" style="color:#c084fc;">
+            <span style="font-size:10px;color:var(--text-dim);margin-right:5px;">${{d.cagr5.toFixed(1)}}% 5Y</span>${{d.cagr10.toFixed(1)}}%
+            <span style="font-size:9px;margin-left:5px;color:${{d.cagr5>d.cagr10?'var(--emerald)':'var(--coral)'}}">${{d.cagr5>d.cagr10?'▲ accel':'▼ decel'}}</span>
+          </div>
+        </div>`).join('')}}
+      </div>`;
+  }}
+
+  else if (type === 'pe') {{
+    const avg = (data.reduce((s,d)=>s+d.pe,0)/data.length).toFixed(1);
+    const maxP = Math.max(...data.map(d=>d.pe));
+    const sorted = [...data].sort((a,b)=>a.pe-b.pe);
+    title.textContent = '⚖️ Valuation: P/E Ratios';
+    subtitle.textContent = 'What the market pays per $1 of profit';
+    body.innerHTML = `
+      <div class="modal-stat-hero">
+        <div class="big-val" style="color:var(--coral);">${{avg}}×</div>
+        <div class="big-label">Average P/E Ratio</div>
+        <div class="big-desc"><span style="color:var(--emerald);">Green &lt;20×</span> = potential value. <span style="color:var(--amber);">Amber 20–30×</span> = fair. <span style="color:var(--coral);">Red &gt;30×</span> = premium.</div>
+      </div>
+      <div class="modal-bar-wrap">${{sorted.map(d=>`
+        <div class="modal-bar-row">
+          <div class="modal-bar-label">${{d.ticker}}</div>
+          <div class="modal-bar-track"><div class="modal-bar-fill" style="width:${{(d.pe/maxP*100).toFixed(0)}}%;background:${{d.pe<20?'var(--emerald)':d.pe>30?'var(--coral)':'var(--amber)'}};"></div></div>
+          <div class="modal-bar-num" style="color:${{d.pe<20?'var(--emerald)':d.pe>30?'var(--coral)':'var(--amber)'}};">${{d.pe.toFixed(1)}}×</div>
+        </div>`).join('')}}
+      </div>`;
+  }}
+
+  overlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+}}
+
+function closeModal() {{
+  document.getElementById('modalOverlay').classList.remove('open');
+  document.body.style.overflow = '';
+}}
+function closeModalOnBg(e) {{ if (e.target === document.getElementById('modalOverlay')) closeModal(); }}
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') closeModal(); }});
+</script>
+</body>
+</html>"""
+
+    return html
+
+
+def main():
+    print("📡 Fetching live data from Yahoo Finance...")
+    stocks = []
+    for ticker in TICKERS:
+        print(f"  → {ticker}...", end=" ", flush=True)
+        result = fetch_stock(ticker)
+        if result:
+            stocks.append(result)
+            print("✓")
+        else:
+            print("✗ skipped")
+
+    if not stocks:
+        print("❌ No data fetched. Aborting.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n🧮 Scoring {len(stocks)} stocks...")
+    scored = compute_best_value(stocks)
+    print(f"🏅 Best Value: {scored[0]['ticker']} (score: {scored[0]['composite']})")
+
+    run_date = datetime.now().strftime("%B %-d, %Y")
+    run_ts   = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Write to docs/index.html for GitHub Pages
+    docs_dir = Path("docs")
+    docs_dir.mkdir(exist_ok=True)
+    out_path = docs_dir / "index.html"
+    out_path.write_text(build_site(scored, run_date, run_ts), encoding="utf-8")
+    print(f"✅ Live site saved → {out_path}")
+
+
+if __name__ == "__main__":
+    main()
